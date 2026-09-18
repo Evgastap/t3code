@@ -90,6 +90,12 @@ const RECENT_THREAD_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
  */
 const MAX_IMPORTED_TRANSCRIPT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORTED_MESSAGES = 200;
+/**
+ * Memory ceiling for the selected history of one transcript. It bounds a
+ * sliding window: once full, the oldest retained records are dropped, which
+ * costs nothing because only the first user message and the newest
+ * `MAX_IMPORTED_MESSAGES` survive parsing anyway.
+ */
 const MAX_IMPORT_HISTORY_BYTES = 32 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 4 * 1024 * 1024 * 1024;
 const MAX_IMPORT_TRANSCRIPTS = 100;
@@ -536,6 +542,48 @@ function shouldRetainDecodedRecord(
 }
 
 /**
+ * The JSON reader charges its budget from inside a callback, so an exhausted
+ * budget arrives as a thrown error. Keep it in the error channel so the caller
+ * can log why the transcript was dropped instead of an opaque wrapper.
+ */
+const tryWithinBudget = (read: () => boolean) =>
+  Effect.try({
+    try: read,
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+  });
+
+/**
+ * Whether a retained record can become the thread's first user message.
+ * Mirrors the filters `parseAgentSessionRecords` applies, because everything
+ * up to and including this record is pinned in the selected-history window:
+ * the parse needs that message, and the `cwd` and session metadata each CLI
+ * writes at or before it.
+ */
+function isFirstUserMessageCandidate(
+  source: AgentSessionSource,
+  record: DecodedTranscriptRecord,
+): boolean {
+  if (source === "claudeAgent") {
+    return (
+      record.type === "user" &&
+      record.isSidechain !== true &&
+      record.isMeta !== true &&
+      record.isCompactSummary !== true &&
+      extractText(record.message?.content).length > 0
+    );
+  }
+  if (record.type === "event_msg" && record.payload?.type === "user_message") {
+    return (record.payload.message?.trim().length ?? 0) > 0;
+  }
+  return (
+    record.type === "response_item" &&
+    record.payload?.type === "message" &&
+    record.payload.role === "user" &&
+    extractText(record.payload.content).length > 0
+  );
+}
+
+/**
  * T3 Code runs its own agent sessions inside disposable worktrees. Their
  * transcripts look exactly like user sessions, but re-importing the app's own
  * sandboxes as projects is never right. Matches this server's configured
@@ -811,8 +859,9 @@ export const make = Effect.gen(function* () {
 
   /**
    * Project history fields while reading, before allocating whole JSON records.
-   * Check the file identity on both sides of the read. A selected-history budget
-   * failure rejects the entire transcript before any imported messages persist.
+   * Check the file identity on both sides of the read. Selected history is a
+   * sliding window, so a session with years of history still imports; only a
+   * single record larger than the whole budget rejects the transcript.
    */
   const readTranscript = Effect.fn("AgentSessionScanner.readTranscript")(function* (
     filePath: string,
@@ -829,17 +878,29 @@ export const make = Effect.gen(function* () {
             if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
               return null;
             }
-            const records: Array<DecodedTranscriptRecord> = [];
+            // Evicted slots keep the window's indices stable while releasing
+            // the record, so eviction stays O(1) on a long transcript.
+            const records: Array<DecodedTranscriptRecord | undefined> = [];
+            const recordBytesByIndex: Array<number> = [];
+            let windowStart = 0;
+            let hasFirstUserMessage = false;
             let historyBytes = 0;
             let recordBytes = 0;
             let recordCount = 0;
             let bytesRead = 0;
             const reserve = (bytes: number) => {
               recordBytes += bytes;
-              if (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
-                throw new TranscriptJsonLimitError(
-                  "Transcript selected history exceeds the 32 MiB memory budget",
-                );
+              while (historyBytes + recordBytes > MAX_IMPORT_HISTORY_BYTES) {
+                // Nothing evictable means the protected prefix, or one record,
+                // is larger than the whole budget.
+                if (windowStart >= records.length) {
+                  throw new TranscriptJsonLimitError(
+                    "Transcript selected history exceeds the 32 MiB memory budget",
+                  );
+                }
+                historyBytes -= recordBytesByIndex[windowStart] ?? 0;
+                records[windowStart] = undefined;
+                windowStart += 1;
               }
             };
             let reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
@@ -853,7 +914,14 @@ export const make = Effect.gen(function* () {
               const decoded = decodeTranscriptValue(reader.finish());
               if (Option.isSome(decoded) && shouldRetainDecodedRecord(source, decoded.value)) {
                 records.push(decoded.value);
+                recordBytesByIndex.push(recordBytes);
                 historyBytes += recordBytes;
+                // Keep the whole prefix through the first user message by
+                // holding the window's start past it.
+                if (!hasFirstUserMessage) {
+                  windowStart = records.length;
+                  hasFirstUserMessage = isFirstUserMessageCandidate(source, decoded.value);
+                }
               }
               recordBytes = 0;
               reader = createTranscriptJsonReader(reserve, selectTranscriptPath);
@@ -871,7 +939,7 @@ export const make = Effect.gen(function* () {
               }
 
               bytesRead += next.value.byteLength;
-              const withinBudget = yield* Effect.try(() => {
+              const withinBudget = yield* tryWithinBudget(() => {
                 let start = 0;
                 while (start < next.value.byteLength) {
                   const newline = next.value.indexOf(10, start);
@@ -887,18 +955,20 @@ export const make = Effect.gen(function* () {
               if (!withinBudget) return null;
             }
 
-            if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
+            if (recordStarted && !(yield* tryWithinBudget(finishRecord))) return null;
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
-              ? { records, recordCount }
+              ? { records: records.filter((record) => record !== undefined), recordCount }
               : null;
           }),
         ),
       ),
     ).pipe(
       Effect.catch((cause) =>
-        Effect.logWarning("Could not read imported transcript", { filePath, cause }).pipe(
-          Effect.as(null),
-        ),
+        Effect.logWarning("Could not read imported transcript", {
+          filePath,
+          reason: String(cause),
+          cause,
+        }).pipe(Effect.as(null)),
       ),
     );
   });

@@ -50,7 +50,8 @@ export class TranscriptJsonLimitError extends Error {}
 /**
  * Project a single JSONL record without materializing unselected string values.
  * The caller supplies a shared allocation budget for the entire transcript.
- * Budget exhaustion rejects the transcript, never a message within it.
+ * `reserve` may free room by dropping records the caller already kept, so it
+ * throws only when the budget cannot fit the record being read.
  */
 export function createTranscriptJsonReader(
   reserve: (bytes: number) => void,
@@ -121,8 +122,8 @@ export function createTranscriptJsonReader(
         } else if (token.name === "endObject" || token.name === "endArray") {
           if (--depth === 0) complete = true;
         }
-        // Charge keys before assembling them, including unknown names. Reject
-        // the transcript on exhaustion instead of silently shortening a key.
+        // Charge keys before assembling them, including unknown names, so an
+        // exhausted budget never silently shortens a key.
         if (token.name === "startKey") {
           key = "";
         } else if (token.name === "stringChunk" && key !== null) {

@@ -2001,6 +2001,64 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
       }),
     );
 
+    it.effect("imports a session whose retained history outgrows the memory budget", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-claude-home-");
+        const codexHomePath = yield* makeTempDir("t3code-codex-home-");
+        const workspace = yield* makeTempDir("t3code-workspace-");
+        // The reader charges two bytes per selected character, so ~21 MiB of
+        // text costs well over the 32 MiB selected-history budget.
+        const filler = "x".repeat(24 * 1024);
+        const turns: Array<string> = [
+          encodeTranscriptRecord({
+            type: "user",
+            cwd: workspace,
+            sessionId: "long-session",
+            message: { content: "First prompt" },
+          }),
+        ];
+        for (let turn = 0; turn < 450; turn++) {
+          turns.push(
+            encodeTranscriptRecord({
+              type: "user",
+              message: { content: `user ${turn}\n${filler}` },
+            }),
+            encodeTranscriptRecord({
+              type: "assistant",
+              message: { content: `assistant ${turn}\n${filler}` },
+            }),
+          );
+        }
+        yield* writeTranscript({
+          filePath: path.join(claudeHomePath, "projects", "long", "long-session.jsonl"),
+          contents: `${turns.join("\n")}\n`,
+          mtimeMs: nowMs,
+        });
+
+        const outcomes = yield* runRecentThreadOutcomes({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+
+        expect(outcomes.length).toBe(1);
+        const outcome = outcomes[0];
+        expect(outcome?._tag).toBe("Importable");
+        if (outcome?._tag !== "Importable") return;
+        expect(outcome.thread.providerSessionId).toBe("long-session");
+        expect(outcome.thread.messages.length).toBe(200);
+        expect(outcome.thread.messages[0]).toMatchObject({
+          role: "user",
+          text: "First prompt",
+        });
+        expect(outcome.thread.messages.at(-1)).toMatchObject({ role: "assistant" });
+        expect(outcome.thread.messages.at(-1)?.text.startsWith("assistant 449\n")).toBe(true);
+      }),
+    );
+
     it.effect("reports stat, read, and parse failures as skipped", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
